@@ -1,4 +1,4 @@
-# PowerShell Script for querying MX, DMARC and SPF records
+# PowerShell script for querying MX, DMARC and SPF records
 
 # Ask user for paths
 $domainsPath = Read-Host -Prompt "Please enter the full path to the domains.txt file"
@@ -20,18 +20,46 @@ $outputPath = Join-Path $resultsFolder "dns_results.csv"
 $domains = Get-Content -Path $domainsPath
 $retryDomains = @()
 
+# Function to try DNS resolution
+function Resolve-DnsWithFallback {
+    param($DomainName, $RecordType)
+    
+    Write-Host "Attempting $RecordType query for $DomainName..."
+    try {
+        return Resolve-DnsName -Name $DomainName -Type $RecordType -ErrorAction Stop
+    }
+    catch {
+        Write-Host "DNS query failed..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 1
+        throw "DNS query failed"
+    }
+}
+
 # Check if results file already exists
 if (Test-Path $outputPath) {
-    # File exists - Import existing data
     $existingResults = Import-Csv -Path $outputPath
     
-    # Check if nameserver column exists
+    # If only nameservers are missing, add only those
     if ($existingResults[0].PSObject.Properties.Name -notcontains 'Nameserver') {
         Write-Host "Adding nameserver column to existing results..." -ForegroundColor Yellow
         
-        # Add nameserver for each domain
+        $startTime = Get-Date
+        $totalDomains = $existingResults.Count
+        $currentDomain = 0
+        
         $updatedResults = $existingResults | ForEach-Object {
+            $currentDomain++
             $domain = $_.Domain
+            
+            # Calculate progress and estimated time remaining
+            $elapsedTime = (Get-Date) - $startTime
+            $averageTimePerDomain = $elapsedTime.TotalSeconds / $currentDomain
+            $remainingDomains = $totalDomains - $currentDomain
+            $estimatedTimeRemaining = [TimeSpan]::FromSeconds($averageTimePerDomain * $remainingDomains)
+            
+            $progress = [math]::Round(($currentDomain / $totalDomains) * 100, 2)
+            Write-Progress -Activity "Processing Domains" -Status "$domain ($currentDomain of $totalDomains)`nElapsed time: $($elapsedTime.ToString('hh\:mm\:ss'))`nEstimated time remaining: $($estimatedTimeRemaining.ToString('hh\:mm\:ss'))" -PercentComplete $progress
+            
             try {
                 $nsRecords = Resolve-DnsWithFallback -DomainName $domain -RecordType NS
                 $nsString = ($nsRecords | ForEach-Object { $_.NameHost }) -join "; "
@@ -46,6 +74,7 @@ if (Test-Path $outputPath) {
         # Save updated results
         $updatedResults | Export-Csv -Path $outputPath -NoTypeInformation -Force
         Write-Host "Existing results file has been updated with nameserver information." -ForegroundColor Green
+        exit
     }
 }
 
@@ -53,14 +82,23 @@ if (Test-Path $outputPath) {
 $results = @()
 $totalDomains = $domains.Count
 $currentDomain = 0
+$startTime = Get-Date
 
 foreach ($domain in $domains) {
     $currentDomain++
+    
+    # Calculate progress and estimated time remaining
+    $elapsedTime = (Get-Date) - $startTime
+    $averageTimePerDomain = $elapsedTime.TotalSeconds / $currentDomain
+    $remainingDomains = $totalDomains - $currentDomain
+    $estimatedTimeRemaining = [TimeSpan]::FromSeconds($averageTimePerDomain * $remainingDomains)
+    
     $progress = [math]::Round(($currentDomain / $totalDomains) * 100, 2)
-    Write-Progress -Activity "Processing Domains" -Status "$domain ($currentDomain of $totalDomains)" -PercentComplete $progress
+    Write-Progress -Activity "Processing Domains" -Status "$domain ($currentDomain of $totalDomains)`nElapsed time: $($elapsedTime.ToString('hh\:mm\:ss'))`nEstimated time remaining: $($estimatedTimeRemaining.ToString('hh\:mm\:ss'))" -PercentComplete $progress
 
     $result = [PSCustomObject]@{
         Domain = $domain
+        Nameserver = "Not found"
         MX = "Not found"
         DMARC = "Not found"
         DMARC_Subdomain = "Not found"
@@ -68,26 +106,24 @@ foreach ($domain in $domains) {
         SPF_Subdomain = "Not found"
     }
 
-    # Function to try DNS resolution
-    function Resolve-DnsWithFallback {
-        param($DomainName, $RecordType)
-        
-        Write-Host "Trying $RecordType lookup for $DomainName..."
-        try {
-            return Resolve-DnsName -Name $DomainName -Type $RecordType -ErrorAction Stop
-        }
-        catch {
-            Write-Host "DNS lookup failed..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 1
-            throw "DNS lookup failed"
-        }
+    # Query Nameserver
+    try {
+        $nsRecords = Resolve-DnsWithFallback -DomainName $domain -RecordType NS
+        $result.Nameserver = ($nsRecords | ForEach-Object { $_.NameHost }) -join "; "
+        Write-Host "Nameserver found: $($result.Nameserver)" -ForegroundColor Green
+        Start-Sleep -Seconds 1
+    }
+    catch {
+        $result.Nameserver = "Error: $($_.Exception.Message)"
+        Write-Host "Error in nameserver query: $($_.Exception.Message)" -ForegroundColor Red
+        Start-Sleep -Seconds 1
     }
 
     # Query MX Record
     try {
         $mxRecords = Resolve-DnsWithFallback -DomainName $domain -RecordType MX
         $result.MX = ($mxRecords | ForEach-Object { "$($_.NameExchange) (Priority: $($_.Preference))" }) -join "; "
-        Write-Host "MX Record found: $($result.MX)" -ForegroundColor Green
+        Write-Host "MX record found: $($result.MX)" -ForegroundColor Green
         Start-Sleep -Seconds 1
     }
     catch {
@@ -95,7 +131,7 @@ foreach ($domain in $domains) {
         if (!$retryDomains.Contains($domain)) {
             $retryDomains += $domain
         }
-        Write-Host "Error in MX lookup: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Error in MX query: $($_.Exception.Message)" -ForegroundColor Red
         Start-Sleep -Seconds 1
     }
 
@@ -103,15 +139,15 @@ foreach ($domain in $domains) {
     try {
         $dmarcRecord = Resolve-DnsWithFallback -DomainName "_dmarc.$domain" -RecordType TXT
         $result.DMARC = ($dmarcRecord.Strings) -join " "
-        Write-Host "DMARC Record found: $($result.DMARC)" -ForegroundColor Green
+        Write-Host "DMARC record found: $($result.DMARC)" -ForegroundColor Green
         Start-Sleep -Seconds 1
     }
     catch {
-        $result.DMARC = "No DMARC record found on domain level"
+        $result.DMARC = "No DMARC record found at domain level"
         if (!$retryDomains.Contains($domain)) {
             $retryDomains += $domain
         }
-        Write-Host "No DMARC record found on domain level" -ForegroundColor Yellow
+        Write-Host "No DMARC record found at domain level" -ForegroundColor Yellow
         Start-Sleep -Seconds 1
 
         # If no domain level record, check subdomains
@@ -121,14 +157,14 @@ foreach ($domain in $domains) {
                 $dmarcSubRecord = Resolve-DnsWithFallback -DomainName "_dmarc.$sub.$domain" -RecordType TXT
                 if ($dmarcSubRecord) {
                     $result.DMARC_Subdomain = "($sub) " + ($dmarcSubRecord.Strings -join " ")
-                    Write-Host "DMARC Record found on subdomain: $($result.DMARC_Subdomain)" -ForegroundColor Green
+                    Write-Host "DMARC record found in subdomain: $($result.DMARC_Subdomain)" -ForegroundColor Green
                     break
                 }
             }
         }
         catch {
-            $result.DMARC_Subdomain = "No DMARC record found on subdomain level"
-            Write-Host "No DMARC record found on subdomain level" -ForegroundColor Yellow
+            $result.DMARC_Subdomain = "No DMARC record found at subdomain level"
+            Write-Host "No DMARC record found at subdomain level" -ForegroundColor Yellow
         }
     }
 
@@ -137,8 +173,8 @@ foreach ($domain in $domains) {
         $spfRecord = Resolve-DnsWithFallback -DomainName $domain -RecordType TXT
         $result.SPF = ($spfRecord.Strings | Where-Object { $_ -match "^v=spf1" }) -join " "
         if (!$result.SPF) {
-            $result.SPF = "No SPF record found on domain level"
-            Write-Host "No SPF record found on domain level" -ForegroundColor Yellow
+            $result.SPF = "No SPF record found at domain level"
+            Write-Host "No SPF record found at domain level" -ForegroundColor Yellow
             
             # If no domain level record, check subdomains
             $subdomains = "mail", "email", "smtp"
@@ -148,7 +184,7 @@ foreach ($domain in $domains) {
                     $spfSubString = ($spfSubRecord.Strings | Where-Object { $_ -match "^v=spf1" }) -join " "
                     if ($spfSubString) {
                         $result.SPF_Subdomain = "($sub) $spfSubString"
-                        Write-Host "SPF Record found on subdomain: $($result.SPF_Subdomain)" -ForegroundColor Green
+                        Write-Host "SPF record found in subdomain: $($result.SPF_Subdomain)" -ForegroundColor Green
                         break
                     }
                 }
@@ -157,12 +193,12 @@ foreach ($domain in $domains) {
                 }
             }
             if ($result.SPF_Subdomain -eq "Not found") {
-                Write-Host "No SPF record found on subdomain level" -ForegroundColor Yellow
+                Write-Host "No SPF record found at subdomain level" -ForegroundColor Yellow
             }
             Start-Sleep -Seconds 1
         }
         else {
-            Write-Host "SPF Record found: $($result.SPF)" -ForegroundColor Green
+            Write-Host "SPF record found: $($result.SPF)" -ForegroundColor Green
             Start-Sleep -Seconds 1
         }
     }
@@ -171,7 +207,7 @@ foreach ($domain in $domains) {
         if (!$retryDomains.Contains($domain)) {
             $retryDomains += $domain
         }
-        Write-Host "Error in SPF lookup: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Error in SPF query: $($_.Exception.Message)" -ForegroundColor Red
         Start-Sleep -Seconds 1
     }
 
@@ -184,11 +220,11 @@ foreach ($domain in $domains) {
 if ($retryDomains.Count -gt 0) {
     Write-Host "`nProcessing $($retryDomains.Count) domains with previous timeouts...`n" -ForegroundColor Yellow
     foreach ($domain in $retryDomains) {
-        # Same code as above for retry
-        # Omitted for brevity
+        # Same code as above for retry attempts
+        # Omitted for space reasons
     }
 }
 
-# Output results to CSV file
+# Save results to CSV file
 $results | Export-Csv -Path $outputPath -NoTypeInformation -Delimiter "," -Encoding UTF8
 Write-Host "Results have been saved to $outputPath" -ForegroundColor Green
